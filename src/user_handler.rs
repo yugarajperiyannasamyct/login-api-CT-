@@ -1,60 +1,70 @@
 use actix_web::{web, HttpResponse, Responder};
 use sqlx::PgPool;
-use crate::user::NewUser;
+use crate::user::{NewUser, RegisterInput};
 use crate::repositary::{create_user, find_user_by_email};
-use crate::security::verify_password;
-use serde::Deserialize;
+use crate::security::{hash_password, verify_password};
+use crate::jwt::generate_jwt;
+use dotenvy::dotenv;
+use std::env;
+use crate::errors::AppError;
+use validator::Validate;
 
-
-
-fn validate_password(password: &str) -> bool {
-    let len_ok = password.len() >= 8;
-    let has_lower = password.chars().any(|c| c.is_lowercase());
-    let has_upper = password.chars().any(|c| c.is_uppercase());
-    let has_digit = password.chars().any(|c| c.is_ascii_digit());
-    let has_special = password.chars().any(|c| "!@#$%^&*()_+-=[]{}|;:',.<>/?".contains(c));
-
-    len_ok && has_lower && has_upper && has_digit && has_special
+#[derive(serde::Serialize)]
+struct AuthResponse {
+    access_token: String,
 }
 
-#[derive(Deserialize)]
+/// Register user and return JWT
+pub async fn register_user(
+    pool: web::Data<PgPool>,
+    new_user: web::Json<RegisterInput>,
+) -> Result<HttpResponse, AppError> {
+    let input = new_user.into_inner();
+
+    input.validate().map_err(|e| {
+        AppError::Hash(argon2::password_hash::Error::Password) // or create a custom error
+    })?;
+
+    let new_user_data = NewUser {
+        username: input.username,
+        email: input.email,
+        password: input.password,
+    };
+
+    let user = create_user(pool.get_ref(), new_user_data).await?; // ? converts sqlx::Error or hash error to AppError
+    let secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    let token = crate::jwt::generate_jwt(user.id, &secret);
+
+    Ok(HttpResponse::Ok().json(AuthResponse { access_token: token }))
+}
+
+
+/// Login user and return JWT
+#[derive(serde::Deserialize)]
 pub struct LoginInput {
     pub email: String,
     pub password: String,
 }
 
-pub async fn register_user(
-    pool: web::Data<PgPool>,
-    new_user: web::Json<NewUser>,
-) -> impl Responder {
-
-    let user = new_user.into_inner();
-
-        if !validate_password(&user.password) {
-        return HttpResponse::BadRequest().body(
-            "Password must be at least 8 characters, include uppercase, lowercase, digit, and special character"
-        );
-    }
-
-    // Password hashing is already done inside create_user
-    match create_user(pool.get_ref(), user).await {
-        Ok(user) => HttpResponse::Ok().json(user),
-        Err(e) => HttpResponse::InternalServerError().body(format!("Error: {}", e)),
-    }
-}
-
 pub async fn login_user(
     pool: web::Data<PgPool>,
     login: web::Json<LoginInput>,
-) -> impl Responder {
-    match find_user_by_email(pool.get_ref(), &login.email).await {
-        Ok(user) => {
-            if verify_password(&user.password_hash, &login.password) {
-                HttpResponse::Ok().json(user) // in real apps, return JWT instead
-            } else {
-                HttpResponse::Unauthorized().body("Invalid credentials")
-            }
-        }
-        Err(_) => HttpResponse::Unauthorized().body("Invalid credentials"),
+) -> Result<HttpResponse, AppError> {
+    dotenvy::dotenv().ok();
+    let secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+
+    let user = find_user_by_email(pool.get_ref(), &login.email).await?;
+
+    if user.password_hash.is_empty() {
+        return Ok(HttpResponse::InternalServerError().body("Password not set for user"));
+    }
+
+    let is_valid = verify_password(&user.password_hash, &login.password)?;
+    if is_valid {
+        let token = generate_jwt(user.id, &secret);
+        Ok(HttpResponse::Ok().json(AuthResponse { access_token: token }))
+    } else {
+        Ok(HttpResponse::Unauthorized().body("Invalid credentials"))
     }
 }
+
